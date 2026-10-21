@@ -1,0 +1,42 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 本地配置与密钥 ----
+.env
+.env.local
+
+# ---- 模型与索引（体积大 / 可重建，不进仓库）----
+models/
+faiss_index/
+documents/
+reports/
+
+# ---- 用户自己上传的文档（可能含个人信息，绝不提交）----
+uploads/*.pdf
+uploads/*.docx
+uploads/*.txt
+uploads/*.md
+!uploads/.gitkeep
+
+# ---- 历史备份 / 私有数据 ----
+_backup_*/
+_private_*/
+*.bak
+
+# ---- 测试临时目录 ----
+tests/.tmp/
+.pytest_cache/
+.ruff_cache/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
