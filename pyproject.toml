@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-agent-eval"
+version = "0.1.0"
+description = "本地知识库 RAG + RAGAS 自动评测（可复现、可插拔生成模型）"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [".venv", "models", "faiss_index", "reports"]
+
+[tool.ruff.lint]
+# 只开“真问题”类规则：语法错误、未使用导入/变量、导入顺序、常见 bug。
+# 刻意不开 UP（pyupgrade）——本仓库保留 Optional[...] 写法以兼顾可读性。
+select = ["E", "F", "I", "B"]
+ignore = [
+    "E501",  # 中文注释按显示宽度换行，不强求 100 列
+    "B008",
+]

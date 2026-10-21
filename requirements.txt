@@ -1,0 +1,32 @@
+# RAG-Agent dependencies
+# Install: pip install -r requirements.txt
+#
+# NOTE: keep this file ASCII-only.
+# Windows pip reads requirements.txt with the system locale codec (GBK/cp936),
+# so UTF-8 Chinese comments here cause:
+#     UnicodeDecodeError: 'gbk' codec can't decode byte ...
+# Chinese documentation lives in README.md / the diagnosis report instead.
+#
+# Pins worth knowing:
+# - ragas==0.4.3: this project uses evaluate() + legacy metric classes.
+# - langchain 1.x moved HuggingFaceEmbeddings to langchain-huggingface.
+# - ragas 0.4.3 still imports langchain_community.chat_models.vertexai,
+#   which langchain-community 0.4 removed -> see ragas_compat.py.
+#   Do not downgrade langchain-community to 0.3 (conflicts with langchain 1.x).
+
+streamlit>=1.36
+langchain>=1.0
+langchain-community>=0.4
+langchain-huggingface>=1.0
+langchain-ollama>=1.0
+langchain-openai>=1.0
+faiss-cpu>=1.8
+sentence-transformers>=3.0
+pypdf>=4.0
+python-docx>=1.1
+
+# ---- evaluation ----
+ragas==0.4.3
+datasets>=3.0
+openai>=1.60
+pandas>=2.0
