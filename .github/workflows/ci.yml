@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # 只跑纯逻辑测试：不装 torch/faiss，1 分钟内跑完
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check core.py rag_engine.py run_eval.py app.py tests
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Smoke test (无模型环境)
+        # 验证“不装 torch 也能 import 主模块”，这是本仓库刻意的分层设计
+        run: |
+          python - <<'PY'
+          import core, rag_engine
+          from core import split_text, resolve_llm_config
+
+          chunks = split_text("测试句子。" * 400)
+          assert chunks and all(len(c) <= 800 for c in chunks)
+
+          cfg = resolve_llm_config(provider="openai", api_key="sk-test", model="gpt-4o-mini")
+          assert cfg.provider == "openai" and cfg.api_key == "sk-test"
+          print("imports + pure logic ok, chunks:", len(chunks))
+          PY
