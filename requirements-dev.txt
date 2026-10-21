@@ -1,8 +1,14 @@
-"""开发/测试依赖。
-
-CI 只装这一份（不装 torch / faiss / sentence-transformers，约 2GB），
-因为 tests/ 只覆盖 core.py 里的纯逻辑，不需要真实模型。
-"""
+# Development / CI dependencies.
+#
+# CI installs ONLY this file (no torch / faiss / sentence-transformers, ~2GB),
+# because tests/ covers the pure logic in core.py and needs no real model.
+#
+# NOTE: keep this file ASCII-only, and use "#" for comments.
+# - Windows pip reads requirements files with the system locale codec (GBK),
+#   so any non-ASCII character raises UnicodeDecodeError.
+# - Triple-quoted strings are NOT valid requirements; pip parses them as
+#   package names and fails with "Invalid requirement".
+# Both of these broke CI once. Do not repeat.
 
 pytest>=8.0
 pytest-cov>=5.0
