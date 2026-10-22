@@ -29,6 +29,9 @@ _backup_*/
 _private_*/
 *.bak
 
+# ---- 运行日志（问答埋点 / 用户反馈，可能含业务内容）----
+logs/
+
 # ---- 测试临时目录 ----
 tests/.tmp/
 .pytest_cache/
