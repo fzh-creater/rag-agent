@@ -1,8 +1,5 @@
 # RAG-Agent · 本地知识库问答与自动评测
 
-[![CI](https://github.com/fzh-creater/rag-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fzh-creater/rag-agent/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-
 把一堆 PDF / Word / Markdown 变成本地知识库，回答问题并给出**引用来源**；
 同时用 [RAGAS](https://docs.ragas.io/) 把「检索得好不好、回答有没有编」量化成可对比的分数。
 
@@ -51,9 +48,12 @@ Pure logic lives in `core.py` so CI runs without PyTorch.
 - **多格式入库**：PDF / Word / TXT / Markdown，按段落+句末标点切分到 500–800 字，保留文件名与块号
 - **中文友好检索**：多语种 MiniLM + 归一化内积（即余弦相似度），阈值可调，附未过滤的原始分数用于调参
 - **可插拔生成**：本地 Ollama 或任意 OpenAI 兼容云服务，切换只改环境变量，**不用重建索引**
-- **带引用的回答**：每条回答可展开查看命中的文档块、块号与相似度，方便人工核查
+- **带引用的回答**：每条回答可展开查看命中的文档块、块号、相似度，以及**原文片段**
+- **流式输出**：首字延迟从「整段生成时间」压到 1~2 秒，不再白屏
+- **数据飞轮**：每次问答落 JSONL，👍/👎 一键反馈，`python qlog.py --export` 把差评导出成待标注的评测集草案
+- **重复上传自动去重**：按 `content_hash` 判重，同一份文件传两次不会把 Top-K 占满
 - **可复现评测**：10 条带标准答案的问题（含 1 条“知识库里没有”的负样本专测幻觉），输出 JSON + CSV
-- **零模型跑测试**：`core.py` 不依赖 torch/faiss，46 个单元测试在 CI 上 1 分钟内跑完
+- **零模型跑测试**：`core.py` 不依赖 torch/faiss，56 个单元测试在 CI 上 1 分钟内跑完
 
 ## 架构
 
@@ -243,6 +243,41 @@ streamlit run app.py             # 网页看板：指标卡 + 表格 + 多报告
 
 结果写入 `reports/eval_report_*.json` 与 `reports/eval_scores_*.csv`。
 报告把「检索层」和「生成层」的指标分开列——**指标掉了先看是哪一层**，
+
+## 数据闭环：让系统自己找到坏例子
+
+评测集是手写的，只能测「我猜用户会问什么」。真实用户的坏问题，靠下面这条链路捞：
+
+```text
+每次问答 ──► logs/queries.jsonl      问题 / 命中的块与分数 / 回答 / 各阶段耗时
+   │
+   ├─ 👍 / 👎 ──► logs/feedback.jsonl  反馈 + 原因（答非所问 / 事实错误 / 信息不完整 / 引用不对）
+   │
+   └─ 每周 ──► python qlog.py --export ──► logs/bad_cases.json（待标注）
+                                              │
+                                    人工补 ground_truth
+                                              │
+                                              ▼
+                                  合并进 eval_set.json → 下一轮回归测试
+```
+
+用法：
+
+```bash
+python qlog.py            # 看概况：问答数、好评率、差评原因分布
+python qlog.py --export   # 导出 👎 案例为待标注草案
+
+# 网页里点 👍/👎 即刻落盘，无需额外操作
+```
+
+设计上的三个约束（都有单测锁住）：
+
+1. **埋点绝不影响主流程**：写盘失败静默返回，用户仍能正常看到回答；
+2. **只存块的 id 与分数，不存原文**：避免日志变成第二份敏感数据；
+3. **坏行不拖垮文件**：JSONL 半行（进程被杀）会被跳过，其余照常读。
+
+> `logs/` 已在 `.gitignore` 里——它包含真实的提问内容，不应该进仓库。
+
 而不是笼统地说“效果不好”。
 
 ## 设计取舍
@@ -258,7 +293,7 @@ streamlit run app.py             # 网页看板：指标卡 + 表格 + 多报告
    `metrics.base.Metric` 子类，`metrics.collections` 的新式指标只配 `@experiment`；
    混用会抛 `TypeError: All metrics must be initialised metric objects`。
    代码里注明了原因与迁移路径，并定向静音了对应的 deprecation 告警。
-5. **纯逻辑抽到 `core.py`**：CI 不必安装 2GB 的 torch 就能跑 46 个测试，
+5. **纯逻辑抽到 `core.py`**：CI 不必安装 2GB 的 torch 就能跑 56 个测试，
    同时保证“诊断文案”这种容易写歪的逻辑有回归保护。
 6. **失败要说人话**：模型不可用时区分「没装 / 没启动 / 缺模型 / Key 错」，
    每条都给可复制命令；评测在生成失败时自动降级为检索层报告，而不是整体崩掉。
@@ -274,18 +309,22 @@ streamlit run app.py             # 网页看板：指标卡 + 表格 + 多报告
 ├── ragas_compat.py          # ragas 0.4.3 与 langchain-community 0.4 的导入兼容补丁
 ├── eval_set.json            # 评测问题集（含标准答案与负样本）
 ├── data/samples/            # 示例文档，clone 下来即可试跑
-├── tests/                   # 46 个单元测试（不需要模型）
+├── tests/                   # 56 个单元测试（不需要模型）
+├── docs/CASE_STUDY.md       # 产品视角的一页纸：用户 / 取舍 / 结果 / 不足
 ├── 诊断报告.md               # 一次真实排障记录：从 TypeError 到指标可信
 ├── requirements.txt         # 运行依赖
 ├── requirements-dev.txt     # 测试/CI 依赖
 └── .github/workflows/ci.yml # lint + pytest + 无模型冒烟
 ```
 
+> 只想快速判断这个项目值不值得看？读 [docs/CASE_STUDY.md](docs/CASE_STUDY.md)
+> ——一页纸讲清楚「谁用、解决什么、做了哪些取舍、结果如何、哪里还不行」。
+
 ## 测试
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q            # 46 passed
+pytest -q            # 56 passed
 ruff check .
 ```
 

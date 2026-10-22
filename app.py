@@ -19,6 +19,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +29,7 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
+import qlog  # noqa: E402
 from rag_engine import LLMUnavailableError, RAGEngine, default_corpus_dir  # noqa: E402
 
 st.set_page_config(page_title="RAG 知识库 · 问答与评测", page_icon="🤖", layout="wide")
@@ -97,6 +100,10 @@ def fmt(value, digits: int = 4) -> str:
 engine = get_engine()
 stats = engine.stats()
 
+# 匿名会话 id：只用于把同一轮对话的日志串起来，不含用户身份
+if "session_id" not in st.session_state:
+    st.session_state.session_id = uuid.uuid4().hex[:8]
+
 st.sidebar.title("🛠️ 知识库管理")
 st.sidebar.caption(f"当前：{stats['documents']} 篇文档 / {stats['chunks']} 个向量块")
 if stats["document_names"]:
@@ -154,6 +161,48 @@ if not (_llm["server_up"] and _llm["model_present"]):
 
 tab_chat, tab_eval = st.tabs(["💬 智能问答", "📊 评测报告"])
 
+
+def render_sources(sources: list, expanded: bool = False) -> None:
+    """引用列表：文件名 + 块号 + 相似度，可展开看原文片段。"""
+    if not sources:
+        return
+    with st.expander(f"引用来源（{len(sources)} 条）", expanded=expanded):
+        for rank, src in enumerate(sources, start=1):
+            st.markdown(
+                f"**[{rank}]** `{src['document_name']}` · chunk {src['chunk_id']} · "
+                f"相似度 {src['score']}"
+            )
+            snippet = (src.get("snippet") or "").strip()
+            if snippet:
+                with st.expander("查看原文", expanded=False):
+                    st.code(snippet, language="text")
+
+
+def render_feedback(query_id: str) -> None:
+    """👍/👎 反馈入口。点了立刻落盘，用于后续把坏例回流成评测集。"""
+    if not query_id:
+        return
+
+    col_up, col_down, _ = st.columns([1, 1, 4])
+    if col_up.button("👍 有帮助", key=f"up_{query_id}"):
+        qlog.log_feedback(query_id, "up")
+        st.toast("已记录，谢谢反馈")
+
+    if col_down.button("👎 有问题", key=f"down_{query_id}"):
+        st.session_state["feedback_open"] = query_id
+
+    if st.session_state.get("feedback_open") == query_id:
+        reason = st.selectbox(
+            "哪里有问题？",
+            qlog.FEEDBACK_REASONS,
+            key=f"reason_{query_id}",
+        )
+        if st.button("提交反馈", key=f"submit_{query_id}"):
+            qlog.log_feedback(query_id, "down", reason=reason)
+            st.session_state["feedback_open"] = None
+            st.toast("已记录，这条会进入待标注队列")
+
+
 # ================== Tab 1：问答 ==================
 with tab_chat:
     if "chat_history" not in st.session_state:
@@ -166,12 +215,7 @@ with tab_chat:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("sources"):
-                with st.expander(f"引用来源（{len(message['sources'])} 条）"):
-                    for rank, src in enumerate(message["sources"], start=1):
-                        st.markdown(
-                            f"**[{rank}]** `{src['document_name']}` "
-                            f"chunk_id={src['chunk_id']} 相似度={src['score']}"
-                        )
+                render_sources(message["sources"])
 
     prompt = st.chat_input("请输入您的问题...")
 
@@ -181,9 +225,21 @@ with tab_chat:
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
+            started = time.perf_counter()
             try:
-                with st.spinner("正在检索知识库并生成回答..."):
-                    result = engine.query_with_sources(prompt)
+                with st.spinner("正在检索知识库..."):
+                    sources = engine.retrieve(prompt)
+                retrieval_ms = (time.perf_counter() - started) * 1000
+                contexts = [s["content"] for s in sources]
+
+                if not sources:
+                    st.warning("没有检索到超过阈值的内容，下面的回答可能缺少依据。")
+
+                # 流式输出：首字延迟从「整段生成时间」降到 1 秒内
+                gen_started = time.perf_counter()
+                answer = st.write_stream(engine.generate_stream(prompt, contexts))
+                generation_ms = (time.perf_counter() - gen_started) * 1000
+                answer = answer or ""
             except LLMUnavailableError as exc:
                 st.error(str(exc))
                 st.stop()
@@ -191,24 +247,40 @@ with tab_chat:
                 st.error(f"生成失败：{type(exc).__name__}: {exc}")
                 st.stop()
 
-            st.markdown(result["answer"])
-            if result["sources"]:
-                with st.expander(f"引用来源（{len(result['sources'])} 条）"):
-                    for rank, src in enumerate(result["sources"], start=1):
-                        st.markdown(
-                            f"**[{rank}]** `{src['document_name']}` "
-                            f"chunk_id={src['chunk_id']} 相似度={src['score']}"
-                        )
+            if sources:
+                render_sources(sources)
             else:
                 st.info("本次没有检索到超过阈值的内容，回答可能缺少依据。")
+
+            # 埋点：这条记录是后续「bad case → 评测集」的原料
+            query_id = qlog.log_query(
+                question=prompt,
+                answer=answer,
+                sources=sources,
+                retrieval_ms=retrieval_ms,
+                generation_ms=generation_ms,
+                model=engine.chat_model_name(),
+                session_id=st.session_state.get("session_id", ""),
+            )
+            st.session_state["last_query_id"] = query_id
 
         st.session_state.chat_history.append(
             {
                 "role": "assistant",
-                "content": result["answer"],
-                "sources": result["sources"],
+                "content": answer,
+                "sources": sources,
             }
         )
+
+    # 反馈区必须放在 `if prompt` 之外：点 👍/👎 会触发 rerun，而 rerun 时
+    # chat_input 返回 None，若把按钮渲染在里面，按钮会在被点后立刻消失。
+    last_query_id = st.session_state.get("last_query_id")
+    if last_query_id:
+        st.caption(
+            f"刚才这轮问答是否有帮助？你的反馈会进入待标注队列"
+            f"（记录 id `{last_query_id}`）"
+        )
+        render_feedback(last_query_id)
 
 # ================== Tab 2：评测看板 ==================
 with tab_eval:

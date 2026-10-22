@@ -21,13 +21,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Iterable, Iterator, List, Optional, Union
 
 # 屏蔽 langchain-community 的“停止维护”提示：只是 deprecation 告警，
 # 混在评测输出里容易被误认为报错。
@@ -206,10 +207,45 @@ class RAGEngine:
     # 索引构建
     # ------------------------------------------------------------------
 
+    def _existing_hashes(self) -> set:
+        """已入库块的 content_hash 集合，用于重复上传时去重。
+
+        不读旧索引也能用，但会扫一遍 docstore（块数万级以内影响可忽略）。
+        """
+        self.load_index()
+        if self.vectorstore is None:
+            return set()
+        docstore = getattr(self.vectorstore, "docstore", None)
+        hashes = set()
+        for doc_id in getattr(self.vectorstore, "index_to_docstore_id", {}).values():
+            try:
+                doc = docstore.search(doc_id)
+            except Exception:  # noqa: BLE001
+                continue
+            digest = (doc.metadata or {}).get("content_hash")
+            if digest:
+                hashes.add(digest)
+        return hashes
+
+    @staticmethod
+    def _hash_bytes(data: bytes) -> str:
+        return hashlib.sha1(data).hexdigest()
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
     def ingest(self, file_paths: Iterable[Union[str, Path]]) -> int:
-        """解析并入库一批文档，返回新增块数量；已有索引时增量追加。"""
+        """解析并入库一批文档，返回新增块数量；已有索引时增量追加。
+
+        **重复上传会按 content_hash 去重**：同一份文件传两次、或同一段文字
+        出现在两个文件里，都不会重复入库（否则 Top-K 会被同一文档占满）。
+        """
         all_chunks: List[Any] = []
         from langchain_core.documents import Document
+
+        existing = self._existing_hashes()
+        skipped_chunks = 0
 
         for file_path in file_paths:
             path = Path(file_path)
@@ -224,19 +260,40 @@ class RAGEngine:
                 continue
 
             document_name = path.name
+            try:
+                doc_id = self._hash_bytes(path.read_bytes())[:16]  # 文档级指纹
+            except OSError:
+                doc_id = self._hash_text(document_name)[:16]
+
+            added = 0
             for chunk in chunks:
+                digest = self._hash_text(chunk)
+                if digest in existing:  # 内容已存在，跳过
+                    skipped_chunks += 1
+                    continue
+                existing.add(digest)
                 all_chunks.append(
                     Document(
                         page_content=chunk,
                         metadata={
                             "document_name": document_name,
+                            "doc_id": doc_id,
+                            "content_hash": digest,
                             "chunk_id": self._next_chunk_id,
                             "source": str(path),
                         },
                     )
                 )
                 self._next_chunk_id += 1
-            print(f"[解析] {document_name}: 切分为 {len(chunks)} 个块")
+                added += 1
+
+            if added:
+                print(f"[解析] {document_name}: 切分为 {len(chunks)} 个块，新增 {added} 个")
+            else:
+                print(f"[跳过] {document_name}: 内容与索引中的完全重复，未新增")
+
+        if skipped_chunks:
+            print(f"[去重] 共跳过 {skipped_chunks} 个重复块")
 
         if not all_chunks:
             return 0
@@ -460,6 +517,17 @@ class RAGEngine:
     def build_prompt(self, question: str, contexts: List[str]) -> str:
         return build_prompt(question, contexts, MAX_CONTEXT_CHUNKS)
 
+    def _raise_llm_error(self, exc: Exception) -> None:
+        """把底层异常转成带排查建议的可读错误。"""
+        hints = diagnose_llm(self.llm_config)["hints"] or ["检查接口地址、模型名与网络后重试。"]
+        raise LLMUnavailableError(
+            "无法调用生成模型：\n"
+            f"  端点: {self.llm_config.base_url}\n"
+            f"  模型: {self.chat_model_name()}\n"
+            f"  原始错误: {type(exc).__name__}: {exc}\n"
+            "建议按下面顺序排查：\n  - " + "\n  - ".join(hints)
+        ) from exc
+
     def generate(self, question: str, contexts: List[str]) -> str:
         """调用大模型，根据上下文生成回答（失败抛 LLMUnavailableError）。"""
         prompt = self.build_prompt(question, contexts)
@@ -474,15 +542,40 @@ class RAGEngine:
                 max_tokens=800,
             )
         except Exception as exc:  # noqa: BLE001 统一转成可读错误
-            hints = diagnose_llm(self.llm_config)["hints"] or ["检查接口地址、模型名与网络后重试。"]
-            raise LLMUnavailableError(
-                "无法调用生成模型：\n"
-                f"  端点: {self.llm_config.base_url}\n"
-                f"  模型: {self.chat_model_name()}\n"
-                f"  原始错误: {type(exc).__name__}: {exc}\n"
-                "建议按下面顺序排查：\n  - " + "\n  - ".join(hints)
-            ) from exc
+            self._raise_llm_error(exc)
+            raise  # 只为让类型检查器知道此处不会继续
         return (resp.choices[0].message.content or "").strip()
+
+    def generate_stream(self, question: str, contexts: List[str]) -> Iterator[str]:
+        """流式生成：逐段 yield 文本增量。
+
+        为什么重要：非流式下用户要等整段生成完（云端 2~5 秒、本地 7B 可能 10 秒+），
+        体感像卡死；流式把「首字延迟」从整段延迟降到 <1 秒。
+
+        Yields:
+            文本增量（可能为空串，调用方自行过滤）
+        """
+        prompt = self.build_prompt(question, contexts)
+        try:
+            stream = self._client().chat.completions.create(
+                model=self.chat_model_name(),
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+                stream=True,
+            )
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0].delta, "content", None)
+                if delta:
+                    yield delta
+        except Exception as exc:  # noqa: BLE001
+            self._raise_llm_error(exc)
 
     # ------------------------------------------------------------------
     # 端到端问答
@@ -501,7 +594,7 @@ class RAGEngine:
         """检索 + 生成，同时返回引用来源。
 
         Returns:
-            {"answer", "sources": [{document_name, chunk_id, score}], "contexts": [str]}
+            {"answer", "sources": [{document_name, chunk_id, score, snippet}], "contexts": [str]}
         """
         results = self.search(question, top_k=top_k, score_threshold=min_score)
         contexts = [item["content"] for item in results]
@@ -511,10 +604,26 @@ class RAGEngine:
                 "document_name": item["document_name"],
                 "chunk_id": item["chunk_id"],
                 "score": item["score"],
+                # 给前端展示"原文片段"，让引用可核对（不截断会在页面上刷屏）
+                "snippet": item["content"][:400],
             }
             for item in results
         ]
         return {"answer": answer, "sources": sources, "contexts": contexts}
+
+    def retrieve(self, question: str, top_k: Optional[int] = None, min_score: Optional[float] = None) -> List[dict]:
+        """只检索不生成，返回带 snippet 的来源列表（流式回答时先拿来源）。"""
+        results = self.search(question, top_k=top_k, score_threshold=min_score)
+        return [
+            {
+                "document_name": item["document_name"],
+                "chunk_id": item["chunk_id"],
+                "score": item["score"],
+                "snippet": item["content"][:400],
+                "content": item["content"],
+            }
+            for item in results
+        ]
 
 
 def main() -> None:
