@@ -1,4 +1,6 @@
 # RAG-Agent · 本地知识库问答与自动评测
+[![CI](https://github.com/fzh-creater/rag-agent/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/fzh-creater/rag-agent/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 把一堆 PDF / Word / Markdown 变成本地知识库，回答问题并给出**引用来源**；
 同时用 [RAGAS](https://docs.ragas.io/) 把「检索得好不好、回答有没有编」量化成可对比的分数。
