@@ -389,14 +389,52 @@ def start_ollama_server(cfg: Optional[LLMConfig] = None, wait_seconds: int = 90)
 # 文本切分（中文友好，不依赖任何第三方库）
 # ---------------------------------------------------------------------------
 
-def split_text(text: str, min_size: int = 500, max_size: int = 800) -> List[str]:
+def _overlap_tail(text: str, overlap: int) -> str:
+    """取上一块末尾的一段，用于和下一块重叠。
+
+    目标是"从句子边界开始，长度接近 overlap"：
+
+    1. 先取末尾 ``overlap`` 字，找里面最早的句末标点，取它后面的内容；
+    2. 如果截出来太短（不到 overlap 的一半），说明那句话很长，
+       就把窗口向左扩（+100 / +200 / +400 字）再找，直到长度够；
+    3. 实在找不到边界，才退回原始截断（从句子中间开始）。
+
+    这样既保证重叠长度，又尽量不让下一块从半句话开始。
+    """
+    if overlap <= 0 or not text:
+        return ""
+
+    min_keep = max(20, overlap // 2)
+    for extra in (0, 100, 200, 400):
+        window = text[-(overlap + extra) :]
+        earliest = -1
+        for mark in ("。", "！", "？", "\n"):
+            idx = window.find(mark)
+            if idx >= 0 and (earliest < 0 or idx < earliest):
+                earliest = idx
+        if earliest >= 0 and len(window) - earliest - 1 >= min_keep:
+            return window[earliest + 1 :].lstrip("\n")
+    return text[-overlap:].lstrip("\n")
+
+
+def split_text(
+    text: str,
+    min_size: int = 500,
+    max_size: int = 800,
+    overlap: int = 0,
+) -> List[str]:
     """把文本切分为长度尽量落在 [min_size, max_size] 区间的块。
 
     1. 细分：先按空行切段落；超长段落按句末标点切句；单句仍超长则硬切；
     2. 贪心打包：不断累进片段，直到再加一个就超过 max_size；
        - 当前块已达 min_size：保存，用新片段开新块；
        - 当前块未达 min_size：从新片段截取剩余空间凑满后保存；
-    3. 末尾不足 min_size 的残余作为最后一块保留。
+    3. 末尾不足 min_size 的残余作为最后一块保留；
+    4. **重叠**：把上一块末尾的 ``overlap`` 字接到下一块开头。
+
+    为什么要重叠：事实经常跨在块边界上（比如"年假 5 天"和"满 3 年 10 天"被切开），
+    重叠能让边界两侧的块都包含完整语义。代价是每块最多变成 ``max_size + overlap``，
+    并且相邻块会有重复文字，可能占用 Top-K 名额——所以默认值仍是 0，需要实测再开。
     """
     import re
 
@@ -439,6 +477,15 @@ def split_text(text: str, min_size: int = 500, max_size: int = 800) -> List[str]
 
     if buffer.strip():
         chunks.append(buffer.strip())
+
+    # ---------- 第 3 步：相邻块重叠 ----------
+    if overlap > 0 and len(chunks) > 1:
+        origin = list(chunks)
+        chunks = [origin[0]]
+        for i in range(1, len(origin)):
+            tail = _overlap_tail(origin[i - 1], overlap)
+            chunks.append(f"{tail}\n{origin[i]}".strip() if tail else origin[i])
+
     return chunks
 
 

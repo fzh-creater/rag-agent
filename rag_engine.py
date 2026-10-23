@@ -129,6 +129,7 @@ class RAGEngine:
         model_name: str = DEFAULT_MODEL_NAME,
         chunk_min_chars: int = 500,
         chunk_max_chars: int = 800,
+        chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "0")),
         top_k: int = 5,
         score_threshold: float = 0.25,
         upload_dir: str = "uploads",
@@ -178,6 +179,7 @@ class RAGEngine:
         self.model_name = model_name
         self.chunk_min_chars = chunk_min_chars
         self.chunk_max_chars = chunk_max_chars
+        self.chunk_overlap = max(0, int(chunk_overlap))
         self.top_k = top_k
         self.score_threshold = score_threshold
 
@@ -254,7 +256,9 @@ class RAGEngine:
                 continue
 
             text = parse_document(path)
-            chunks = split_text(text, self.chunk_min_chars, self.chunk_max_chars)
+            chunks = split_text(
+                text, self.chunk_min_chars, self.chunk_max_chars, self.chunk_overlap
+            )
             if not chunks:
                 print(f"[跳过] 未提取到有效文本: {path}")
                 continue
